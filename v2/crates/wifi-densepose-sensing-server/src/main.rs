@@ -666,8 +666,23 @@ struct NodeState {
     rssi_history: VecDeque<f64>,
     vital_detector: VitalSignDetector,
     latest_vitals: VitalSigns,
+    /// The detector is built for 10 Hz and has no timestamps: it reads its
+    /// buffer as evenly spaced 0.1 s samples. Boards deliver their primary
+    /// transmitter at ~8-22 Hz and unevenly, which scaled every rate it
+    /// reported (node 2 at ~21 Hz read 15 breaths/min as ~32). Frames now feed
+    /// it on a 10 Hz wall clock: an early frame is skipped, a short gap repeats
+    /// the last frame (zero-order hold), a gap over 2 s resets it. 2 Oct 2026.
+    vitals_tick: Option<std::time::Instant>,
+    last_raw_vitals: VitalSigns,
+    /// Consecutive raw readings the jump guard rejected (see smooth_vitals_node).
+    hr_rejected: VecDeque<f64>,
+    br_rejected: VecDeque<f64>,
     pub(crate) last_frame_time: Option<std::time::Instant>,
     edge_vitals: Option<Esp32VitalsPacket>,
+    /// When `edge_vitals` last arrived (server clock), for the edge presence gate.
+    edge_vitals_at: Option<std::time::Instant>,
+    /// Consecutive edge packets with presence=true (debounce for the gate).
+    edge_present_streak: u32,
     /// ADR-110 §A0.12: Latest sync packet received from this node. When a
     /// CSI frame arrives with byte 19 bit 4 set (`adr018_flags.ieee802154_sync_valid`),
     /// the host can recover a mesh-aligned timestamp via
@@ -947,8 +962,14 @@ impl NodeState {
             rssi_history: VecDeque::new(),
             vital_detector: VitalSignDetector::new(10.0),
             latest_vitals: VitalSigns::default(),
+            vitals_tick: None,
+            last_raw_vitals: VitalSigns::default(),
+            hr_rejected: VecDeque::new(),
+            br_rejected: VecDeque::new(),
             last_frame_time: None,
             edge_vitals: None,
+            edge_vitals_at: None,
+            edge_present_streak: 0,
             latest_sync: None,
             latest_sync_at: None,
             csi_fps_ema: 20.0,
@@ -2583,6 +2604,42 @@ fn smooth_and_classify(state: &mut AppStateInner, raw: &mut ClassificationInfo, 
     raw.confidence = (0.4 + sm * 0.6).clamp(0.0, 1.0);
 }
 
+/// Opt-in (`RUVIEW_EDGE_PRESENCE_GATE=1`): let a tier-2 node's own presence
+/// flag veto the raw-CSI classification. The firmware learns its presence
+/// threshold from an empty room at boot (mean + 3 sigma over 1200 frames);
+/// `smooth_and_classify_node` uses fixed compile-time cut-offs that a noisy
+/// empty room sits above permanently, so without this an empty room never
+/// reads absent. Only a FRESH edge verdict (< 5 s) counts, so a node that stops
+/// sending vitals falls back to the stock behaviour.
+const EDGE_PRESENT_CONFIRM: u32 = 3;
+const EDGE_VERDICT_TTL_S: u64 = 15;
+
+fn edge_presence_gate_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RUVIEW_EDGE_PRESENCE_GATE").map(|v| v == "1").unwrap_or(false))
+}
+
+fn apply_edge_presence_gate(ns: &mut NodeState, raw: &mut ClassificationInfo) {
+    if !edge_presence_gate_enabled() {
+        return;
+    }
+    // Firmware presence blips for single packets in an empty room (measured
+    // 5-10% of packets on nodes whose boot baseline is imperfect), so a node
+    // only counts as occupied after EDGE_PRESENT_CONFIRM consecutive packets.
+    let edge_says_empty = match ns.edge_vitals_at {
+        Some(at) => {
+            at.elapsed() < std::time::Duration::from_secs(EDGE_VERDICT_TTL_S)
+                && ns.edge_present_streak < EDGE_PRESENT_CONFIRM
+        }
+        None => false,
+    };
+    if edge_says_empty {
+        raw.presence = false;
+        raw.motion_level = "absent".to_string();
+        ns.current_motion_level = "absent".to_string();
+    }
+}
+
 /// Per-node variant of `smooth_and_classify` that operates on a `NodeState`
 /// instead of `AppStateInner` (issue #249).
 fn smooth_and_classify_node(ns: &mut NodeState, raw: &mut ClassificationInfo, raw_motion: f64) {
@@ -2744,8 +2801,29 @@ fn smooth_vitals_node(ns: &mut NodeState, raw: &VitalSigns) -> VitalSigns {
     let raw_hr = raw.heart_rate_bpm.unwrap_or(0.0);
     let raw_br = raw.breathing_rate_bpm.unwrap_or(0.0);
 
-    let hr_ok = ns.smoothed_hr < 1.0 || (raw_hr - ns.smoothed_hr).abs() < HR_MAX_JUMP;
-    let br_ok = ns.smoothed_br < 1.0 || (raw_br - ns.smoothed_br).abs() < BR_MAX_JUMP;
+    let mut hr_ok = ns.smoothed_hr < 1.0 || (raw_hr - ns.smoothed_hr).abs() < HR_MAX_JUMP;
+    let mut br_ok = ns.smoothed_br < 1.0 || (raw_br - ns.smoothed_br).abs() < BR_MAX_JUMP;
+    // Lock-in guard (2 Oct 2026). The first estimate comes from a nearly empty,
+    // low-resolution buffer; the jump guard then rejected every later reading
+    // more than BR_MAX_JUMP / HR_MAX_JUMP away, so a node kept its first guess
+    // forever (a synthetic 15 bpm read 9.375 bpm for good). A full median
+    // window of consecutive rejections now re-seeds from those readings.
+    if raw_hr > 0.0 {
+        if hr_ok { ns.hr_rejected.clear(); } else { ns.hr_rejected.push_back(raw_hr); }
+        if ns.hr_rejected.len() >= VITAL_MEDIAN_WINDOW {
+            ns.hr_buffer = std::mem::take(&mut ns.hr_rejected);
+            ns.smoothed_hr = 0.0;
+            hr_ok = false; // already in the buffer
+        }
+    }
+    if raw_br > 0.0 {
+        if br_ok { ns.br_rejected.clear(); } else { ns.br_rejected.push_back(raw_br); }
+        if ns.br_rejected.len() >= VITAL_MEDIAN_WINDOW {
+            ns.br_buffer = std::mem::take(&mut ns.br_rejected);
+            ns.smoothed_br = 0.0;
+            br_ok = false;
+        }
+    }
 
     if hr_ok && raw_hr > 0.0 {
         ns.hr_buffer.push_back(raw_hr);
@@ -5775,7 +5853,22 @@ fn chrono_timestamp() -> u64 {
 async fn vital_signs_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
     let vs = &s.latest_vitals;
-    let (br_len, br_cap, hb_len, hb_cap) = s.vital_detector.buffer_status();
+    // With ESP32 nodes the rates come from each node's OWN detector; the global
+    // one is never fed on that path, so reporting only its buffer said "0
+    // samples" beside real rates (2 Oct 2026). Report the fullest node buffer,
+    // and every node's under per_node.
+    let (mut br_len, mut br_cap, mut hb_len, mut hb_cap) = s.vital_detector.buffer_status();
+    let mut per_node = serde_json::Map::new();
+    for (id, ns) in s.node_states.iter() {
+        let (a, b, c, d) = ns.vital_detector.buffer_status();
+        per_node.insert(id.to_string(), serde_json::json!({
+            "breathing_samples": a, "breathing_capacity": b,
+            "heartbeat_samples": c, "heartbeat_capacity": d,
+            "breathing_rate_bpm": ns.latest_vitals.breathing_rate_bpm,
+            "heart_rate_bpm": ns.latest_vitals.heart_rate_bpm,
+        }));
+        if a > br_len { br_len = a; br_cap = b; hb_len = c; hb_cap = d; }
+    }
     Json(serde_json::json!({
         "vital_signs": {
             "breathing_rate_bpm": vs.breathing_rate_bpm,
@@ -5789,6 +5882,8 @@ async fn vital_signs_endpoint(State(state): State<SharedState>) -> Json<serde_js
             "breathing_capacity": br_cap,
             "heartbeat_samples": hb_len,
             "heartbeat_capacity": hb_cap,
+            "per_node": per_node,
+            "sample_clock_hz": 10.0,
         },
         "source": s.effective_source(),
         "tick": s.tick,
@@ -6168,6 +6263,48 @@ async fn udp_receiver_task(
     };
 
     let mut buf = vec![0u8; wifi_densepose_hardware::rtl8720f::RTL8720F_RADAR_MAX_FRAME_LEN];
+    // Opt-in raw tee (RUVIEW_UDP_TEE=127.0.0.1:5006): copy every admitted
+    // datagram verbatim to a local collector, which needs the per-subcarrier
+    // I/Q that recordings and the WebSocket both drop. Fire-and-forget.
+    let tee = match std::env::var("RUVIEW_UDP_TEE") {
+        Ok(dst) if !dst.is_empty() => match std::net::UdpSocket::bind("127.0.0.1:0") {
+            Ok(s) => {
+                let _ = s.set_nonblocking(true);
+                info!("UDP tee: copying admitted CSI datagrams to {dst}");
+                Some((s, dst))
+            }
+            Err(e) => {
+                warn!("UDP tee disabled, bind failed: {e}");
+                None
+            }
+        },
+        _ => None,
+    };
+    // Multi-illuminator firmware (csi_collector.c MI_MAX_SRC) sends CSI from up
+    // to 8 transmitters per node and appends the 6-byte transmitter MAC after
+    // the I/Q. Every per-node stage below (features, presence, vitals, person
+    // count) assumes ONE transmitter's channel over time; interleaving four
+    // multipath views turns its spectra into noise. RUVIEW_PRIMARY_SRC=
+    // "1=aa:bb:cc:00:00:01,2=aa:bb:cc:00:00:02,..." names each node's primary
+    // (its filter_mac, the only source the firmware feeds edge processing), and
+    // only that source reaches the pipeline. The raw tee above still gets every
+    // frame. Frames without the trailer (older firmware) and nodes not listed
+    // pass unchanged. 2 Oct 2026.
+    let primary_src: std::collections::HashMap<u8, [u8; 6]> = std::env::var("RUVIEW_PRIMARY_SRC")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|kv| {
+            let (n, mac) = kv.trim().split_once('=')?;
+            let node: u8 = n.trim().parse().ok()?;
+            let bytes: Vec<u8> = mac.trim().split(':').filter_map(|h| u8::from_str_radix(h, 16).ok()).collect();
+            let arr: [u8; 6] = bytes.try_into().ok()?;
+            Some((node, arr))
+        })
+        .collect();
+    if !primary_src.is_empty() {
+        info!("Primary-source filter: {} node(s) keep only their primary transmitter", primary_src.len());
+    }
+    let mut non_primary_dropped: u64 = 0;
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((len, src)) => {
@@ -6179,6 +6316,26 @@ async fn udp_receiver_task(
                         allowlist.dropped()
                     );
                     continue;
+                }
+                if let Some((ref ts, ref dst)) = tee {
+                    let _ = ts.send_to(&buf[..len], dst.as_str());
+                }
+                if !primary_src.is_empty()
+                    && len >= 20
+                    && u32::from_le_bytes(buf[..4].try_into().expect("four-byte slice")) == 0xC511_0001
+                {
+                    let iq_len = buf[5] as usize * u16::from_le_bytes([buf[6], buf[7]]) as usize * 2;
+                    if len >= 20 + iq_len + 6 {
+                        if let Some(want) = primary_src.get(&buf[4]) {
+                            if buf[20 + iq_len..20 + iq_len + 6] != want[..] {
+                                non_primary_dropped += 1;
+                                if non_primary_dropped == 1 || non_primary_dropped % 100_000 == 0 {
+                                    info!("Primary-source filter: {non_primary_dropped} non-primary CSI frames kept out of the pipeline (still teed)");
+                                }
+                                continue;
+                            }
+                        }
+                    }
                 }
                 if len > 0 && buf[0] == b'{' {
                     match serde_json::from_slice::<wifi_densepose_hardware::vendor_rf::VendorRfEvent>(&buf[..len])
@@ -6310,13 +6467,17 @@ async fn udp_receiver_task(
                         warn!(name: semconv::EVENT_RUVIEW_FALL_DETECTED, { "ruview.node.id" = node_id }, "fall detected by node {node_id}");
                     }
                     ns.edge_vitals = Some(vitals.clone());
+                    ns.edge_vitals_at = Some(std::time::Instant::now());
+                    ns.edge_present_streak = if vitals.presence { ns.edge_present_streak.saturating_add(1) } else { 0 };
                     ns.rssi_history.push_back(vitals.rssi as f64);
                     if ns.rssi_history.len() > 60 {
                         ns.rssi_history.pop_front();
                     }
 
                     // Store per-node person count from edge vitals.
-                    let node_est = if vitals.presence {
+                    let edge_present = vitals.presence
+                        && (!edge_presence_gate_enabled() || ns.edge_present_streak >= EDGE_PRESENT_CONFIRM);
+                    let node_est = if edge_present {
                         (vitals.n_persons as usize).max(1)
                     } else {
                         0
@@ -6336,7 +6497,7 @@ async fn udp_receiver_task(
 
                     // Aggregate person count: gate on presence first (matching WiFi path).
                     let now = std::time::Instant::now();
-                    let total_persons = if vitals.presence {
+                    let total_persons = if edge_present {
                         let dedup = s.dedup_factor;
                         let (fused, fallback_count) = multistatic_bridge::fuse_or_fallback(
                             &s.multistatic_fuser,
@@ -6752,14 +6913,34 @@ async fn udp_receiver_task(
                             (conf * 0.7 + classification.confidence * 0.3).clamp(0.0, 1.0);
                     }
 
+                    // After the adaptive override, so a fresh edge 'empty' verdict has the last word.
+                    apply_edge_presence_gate(ns, &mut classification);
+
                     ns.rssi_history.push_back(features.mean_rssi);
                     if ns.rssi_history.len() > 60 {
                         ns.rssi_history.pop_front();
                     }
 
-                    let raw_vitals = ns
-                        .vital_detector
-                        .process_frame(&frame.amplitudes, &frame.phases);
+                    // 10 Hz clock for the vitals detector (see NodeState::vitals_tick).
+                    let now_v = std::time::Instant::now();
+                    let step = std::time::Duration::from_millis(100);
+                    let mut pushes = 0u32;
+                    let mut next = ns.vitals_tick.unwrap_or(now_v);
+                    if now_v.saturating_duration_since(next) > std::time::Duration::from_secs(2) {
+                        ns.vital_detector.reset();
+                        next = now_v;
+                    }
+                    while next <= now_v && pushes < 20 {
+                        pushes += 1;
+                        next += step;
+                    }
+                    ns.vitals_tick = Some(next);
+                    for _ in 0..pushes {
+                        ns.last_raw_vitals = ns
+                            .vital_detector
+                            .process_frame(&frame.amplitudes, &frame.phases);
+                    }
+                    let raw_vitals = ns.last_raw_vitals.clone();
                     let vitals = smooth_vitals_node(ns, &raw_vitals);
                     ns.latest_vitals = vitals.clone();
 
