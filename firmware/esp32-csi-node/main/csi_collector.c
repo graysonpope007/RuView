@@ -246,27 +246,62 @@ size_t csi_serialize_frame(const wifi_csi_info_t *info, uint8_t *buf, size_t buf
 /**
  * WiFi CSI callback — invoked by ESP-IDF when CSI data is available.
  */
+/* Multi-illuminator mode: every transmitter this node hears (the in-room AP,
+ * the house AP, the other nodes) lights the room from a different position,
+ * so each is a separate view of the multipath. Instead of discarding
+ * everything but filter_mac, track up to MI_MAX_SRC transmitters, give each a
+ * fair per-source rate, and append the transmitter MAC to the UDP frame so the
+ * host can keep the views apart. Only the PRIMARY source (filter_mac, or all
+ * frames when no filter is set) feeds on-board edge processing, so presence
+ * and vitals behave exactly as before. */
+#define MI_MAX_SRC            8
+#define MI_PER_SRC_US         (40 * 1000)   /* 25 Hz per transmitter */
+typedef struct { uint8_t mac[6]; int64_t last_us; bool used; } mi_src_t;
+static mi_src_t s_mi_src[MI_MAX_SRC];
+
+/* Returns true if this transmitter is due a sample; false = drop. */
+static bool mi_source_due(const uint8_t *mac, int64_t now_us)
+{
+    int free_i = -1, oldest_i = 0;
+    for (int i = 0; i < MI_MAX_SRC; i++) {
+        if (s_mi_src[i].used && memcmp(s_mi_src[i].mac, mac, 6) == 0) {
+            if ((now_us - s_mi_src[i].last_us) < MI_PER_SRC_US) return false;
+            s_mi_src[i].last_us = now_us;
+            return true;
+        }
+        if (!s_mi_src[i].used && free_i < 0) free_i = i;
+        if (s_mi_src[i].last_us < s_mi_src[oldest_i].last_us) oldest_i = i;
+    }
+    int i = free_i >= 0 ? free_i : oldest_i;    /* evict the stalest source */
+    memcpy(s_mi_src[i].mac, mac, 6);
+    s_mi_src[i].last_us = now_us;
+    s_mi_src[i].used = true;
+    return true;
+}
+
 static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
 {
     (void)ctx;
 
-    /* Early rate gate: drop excess callbacks to ~50 Hz to prevent
-     * SPI flash cache crash in WiFi ISR (wDev_ProcessFiq). */
     int64_t now_us = esp_timer_get_time();
-    if ((now_us - s_last_process_us) < CSI_MIN_PROCESS_INTERVAL_US) {
+
+    /* Classify by transmitter BEFORE any rate gate. The old order (global
+     * 20 ms gate, then filter) sampled whichever frame arrived first and then
+     * threw it away if it was not filter_mac, starving the wanted source. */
+    bool primary = !s_filter_mac_set || memcmp(info->mac, s_filter_mac, 6) == 0;
+    if (!mi_source_due(info->mac, now_us)) {
+        s_early_drop++;
+        return;
+    }
+
+    /* Early rate gate: cap total processing to prevent the SPI flash cache
+     * crash in the WiFi ISR (wDev_ProcessFiq). The primary source may pass at
+     * the original 50 Hz; secondary sources share whatever is left. */
+    if ((now_us - s_last_process_us) < CSI_MIN_PROCESS_INTERVAL_US && !primary) {
         s_early_drop++;
         return;
     }
     s_last_process_us = now_us;
-
-    /* ADR-060: MAC address filtering — drop frames from non-matching sources.
-     * Uses defensively-copied s_filter_mac instead of g_nvs_config (which can
-     * be corrupted by wifi_init_sta — same root cause as the node_id clobber). */
-    if (s_filter_mac_set) {
-        if (memcmp(info->mac, s_filter_mac, 6) != 0) {
-            return;  /* Source MAC doesn't match filter — skip frame. */
-        }
-    }
 
     s_cb_count++;
 
@@ -276,8 +311,14 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
                  info->rx_ctrl.rssi, info->rx_ctrl.channel);
     }
 
-    uint8_t frame_buf[CSI_MAX_FRAME_SIZE];
-    size_t frame_len = csi_serialize_frame(info, frame_buf, sizeof(frame_buf));
+    uint8_t frame_buf[CSI_MAX_FRAME_SIZE + 6];
+    size_t frame_len = csi_serialize_frame(info, frame_buf, CSI_MAX_FRAME_SIZE);
+    if (frame_len > 0) {
+        /* Trailer: transmitter MAC. Parsers size the I/Q from the header and
+         * ignore trailing bytes, so this is backward compatible. */
+        memcpy(&frame_buf[frame_len], info->mac, 6);
+        frame_len += 6;
+    }
 
     if (frame_len > 0) {
         /* Rate-limit UDP sends to avoid ENOMEM from lwIP pbuf exhaustion.
@@ -300,8 +341,9 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
         }
     }
 
-    /* ADR-039: Enqueue raw I/Q into edge processing ring buffer. */
-    if (info->buf && info->len > 0) {
+    /* ADR-039: Enqueue raw I/Q into edge processing ring buffer (primary
+     * transmitter only, so edge presence/vitals see one consistent channel). */
+    if (primary && info->buf && info->len > 0) {
         edge_enqueue_csi((const uint8_t *)info->buf, (uint16_t)info->len,
                          (int8_t)info->rx_ctrl.rssi, info->rx_ctrl.channel);
     }

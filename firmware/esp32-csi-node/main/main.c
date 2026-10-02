@@ -69,11 +69,20 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
         ESP_LOGW(TAG, "WiFi disconnected, reason=%d rssi=%d", disc->reason, disc->rssi);
-        if (s_retry_num < MAX_RETRY) {
-            esp_wifi_connect();
-            s_retry_num++;
+        /* Never give up. The old handler stopped after MAX_RETRY and the node
+         * sat dead until power-cycled: on 1 Oct 2026 node 2 needed 9 tries to
+         * find the in-room AP from 30 cm (reason 201, AP not found), so from
+         * across the room it exhausted 10 and never joined. After MAX_RETRY
+         * the boot wait is released (FAIL bit) but reconnecting carries on,
+         * which also covers a link that drops hours later. */
+        esp_wifi_connect();
+        s_retry_num++;
+        if (s_retry_num <= MAX_RETRY) {
             ESP_LOGI(TAG, "Retrying WiFi connection (%d/%d)", s_retry_num, MAX_RETRY);
-        } else {
+        } else if (s_retry_num % 10 == 0) {
+            ESP_LOGW(TAG, "Still retrying WiFi (%d attempts)", s_retry_num);
+        }
+        if (s_retry_num == MAX_RETRY) {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
