@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Move ONE plugged-in RuView board to "room only" (2 Oct 2026): join the mango's
+# The LAST USB session for a RuView board (2 Oct 2026). Moves it to "room only": join the mango's
 # ruview-tx (the in-room transmitter at the desk) instead of the house router
 # downstairs, sense the mango as its primary, and flash the firmware whose
-# allowlist no longer contains the house router. Node 2 was already on ruview-tx.
+# allowlist no longer contains the house router, AND turns on over-the-air
+# updates: an OTA key (RUVIEW_OTA_PSK in cleetus.env) plus 0.8.7 (rollback-
+# enabled bootloader, no 900 KB cap, POST /config). After this, use
+# ruview-node.sh for firmware and settings; no cable.
 #
 #   ./room-only.sh            (exactly one board plugged in; found by its MAC)
 #
@@ -13,6 +16,8 @@ cd "$(dirname "$0")"
 ENVF="$HOME/Documents/Claude/Projects/Cleetus V2/cleetus.env"
 KEY=$(grep -E '^MANGO_WIFI_KEY=' "$ENVF" | head -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
 [ -n "$KEY" ] || { echo "MANGO_WIFI_KEY missing from cleetus.env"; exit 1; }
+PSK=$(grep -E '^RUVIEW_OTA_PSK=' "$ENVF" | head -1 | cut -d= -f2-)
+[ ${#PSK} = 64 ] || { echo "RUVIEW_OTA_PSK missing from cleetus.env"; exit 1; }
 # MACs live in room-only.local.sh (git-ignored; see room-only.local.example.sh):
 # the mango is an access point, and an AP's MAC can be looked up in public
 # Wi-Fi location databases.
@@ -36,11 +41,13 @@ export PATH="/opt/homebrew/opt/python@3.12/bin:$PATH"
 # shellcheck disable=SC1091
 source "$IDF_PATH/export.sh" >/dev/null
 
-if [ "$ID" != 2 ]; then
-  python provision.py --port "$PORT" --ssid ruview-tx --password "$KEY" \
-    --target-ip 192.168.2.1 --target-port 5005 --node-id "$ID" \
-    --tdm-slot "$SLOT" --tdm-total 3 --edge-tier 2 --pres-thresh "$PRES" \
-    --filter-mac "$MANGO" --reset
-fi
-idf.py -p "$PORT" app-flash
+# Settings: room-only Wi-Fi + the OTA key, in ONE image (it replaces the whole
+# NVS partition). Node 2's stale csi_channel=1 is not carried over.
+python provision.py --port "$PORT" --ssid ruview-tx --password "$KEY" \
+  --target-ip 192.168.2.1 --target-port 5005 --node-id "$ID" \
+  --tdm-slot "$SLOT" --tdm-total 3 --edge-tier 2 --pres-thresh "$PRES" \
+  --filter-mac "$MANGO" --ota-psk "$PSK" --reset
+# FULL flash, not app-only: the bootloader has to be the rollback-enabled one
+# (0.8.7) for over-the-air updates to be safe. NVS at 0x9000 is not touched.
+idf.py -p "$PORT" flash
 echo "✓ node $ID done. Put it back ($WHERE)."

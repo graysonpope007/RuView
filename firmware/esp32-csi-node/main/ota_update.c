@@ -11,6 +11,8 @@
 #include "ota_update.h"
 
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_http_server.h"
@@ -99,7 +101,7 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         app->version, app->date, app->time,
         running ? running->label : "unknown",
         update ? update->label : "none",
-        OTA_MAX_SIZE);
+        update ? (int)update->size : 0);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, response, len);
@@ -121,16 +123,19 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
     ESP_LOGI(TAG, "OTA update started, content_length=%d", req->content_len);
 
-    if (req->content_len <= 0 || req->content_len > OTA_MAX_SIZE) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            "Invalid firmware size (must be 1B - 900KB)");
-        return ESP_FAIL;
-    }
-
     const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
     if (update_partition == NULL) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                             "No OTA partition available");
+        return ESP_FAIL;
+    }
+
+    /* 0.8.7: the limit is the slot the image goes into (2 MB here). The old
+     * 900 KB constant matched a CI size gate, not the hardware, and the 0.8.5
+     * image (1.13 MB) could never have been sent over the air. */
+    if (req->content_len <= 0 || (size_t)req->content_len > update_partition->size) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Invalid firmware size (larger than the OTA partition)");
         return ESP_FAIL;
     }
 
@@ -209,6 +214,163 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     return ESP_OK;  /* Never reached. */
 }
 
+/* ── Over-the-air settings (0.8.7, 2 Oct 2026) ───────────────────────────
+ * POST /config, same Bearer PSK as /ota. Body: key=value lines, from this
+ * list only: ssid, password, target_ip, target_port, filter_mac, pres_thresh,
+ * csi_channel (0 erases the override). Everything is validated before
+ * anything is written; then the network-critical keys as they were (ssid,
+ * password, target_ip, filter_mac) are copied to the "cfg_prev" namespace,
+ * cfg_prev/trial is set, the new values are committed and the node reboots.
+ * If it cannot join Wi-Fi with them (ota_boot_wifi_failed), the old values are
+ * restored and it reboots again, so a typo in a password cannot strand a
+ * board that is out of reach of a USB cable. */
+#define CFG_NS      "csi_cfg"
+#define CFG_PREV_NS "cfg_prev"
+
+static int parse_mac(const char *v, uint8_t out[6])
+{
+    int n = 0; unsigned b;
+    for (const char *p = v; *p && n < 6; ) {
+        if (*p == ':' || *p == '-') { p++; continue; }
+        if (sscanf(p, "%2x", &b) != 1) return -1;
+        out[n++] = (uint8_t)b; p += 2;
+    }
+    return n == 6 ? 0 : -1;
+}
+
+static int valid_ipv4(const char *v)
+{
+    unsigned a, b, c, d; char tail;
+    return sscanf(v, "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) == 4 && a < 256 && b < 256 && c < 256 && d < 256;
+}
+
+static void copy_str_key(nvs_handle_t from, nvs_handle_t to, const char *key)
+{
+    char buf[72]; size_t len = sizeof(buf);
+    if (nvs_get_str(from, key, buf, &len) == ESP_OK) nvs_set_str(to, key, buf);
+    else nvs_erase_key(to, key);
+}
+
+static esp_err_t config_handler(httpd_req_t *req)
+{
+    if (!ota_check_auth(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Authentication required. Use: Authorization: Bearer <psk>");
+        return ESP_FAIL;
+    }
+    char body[512] = {0};
+    if (req->content_len <= 0 || req->content_len >= (int)sizeof(body)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body must be 1-511 bytes of key=value lines");
+        return ESP_FAIL;
+    }
+    int got = 0;
+    while (got < req->content_len) {
+        int r = httpd_req_recv(req, body + got, req->content_len - got);
+        if (r <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Receive failed"); return ESP_FAIL; }
+        got += r;
+    }
+
+    /* Pass 1: validate every line; nothing is written if any line is bad. */
+    struct { char key[16]; char val[72]; } kv[8]; int nkv = 0;
+    char *save = NULL;
+    for (char *line = strtok_r(body, "\r\n", &save); line; line = strtok_r(NULL, "\r\n", &save)) {
+        char *eq = strchr(line, '=');
+        if (!eq || eq == line || nkv >= 8) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Each line must be key=value (max 8)"); return ESP_FAIL; }
+        *eq = 0; const char *k = line, *v = eq + 1;
+        bool ok =
+            (!strcmp(k, "ssid") && strlen(v) >= 1 && strlen(v) <= 32) ||
+            (!strcmp(k, "password") && strlen(v) <= 64) ||
+            (!strcmp(k, "target_ip") && valid_ipv4(v)) ||
+            (!strcmp(k, "target_port") && atoi(v) > 0 && atoi(v) < 65536) ||
+            (!strcmp(k, "pres_thresh") && atoi(v) >= 0 && atoi(v) < 65536) ||
+            (!strcmp(k, "csi_channel") && atoi(v) >= 0 && atoi(v) <= 177);
+        uint8_t mac[6];
+        if (!strcmp(k, "filter_mac")) ok = parse_mac(v, mac) == 0;
+        if (!ok) {
+            char msg[64]; snprintf(msg, sizeof(msg), "Rejected key or value: %.24s", k);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg); return ESP_FAIL;
+        }
+        strlcpy(kv[nkv].key, k, sizeof(kv[nkv].key)); strlcpy(kv[nkv].val, v, sizeof(kv[nkv].val)); nkv++;
+    }
+    if (nkv == 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No settings given"); return ESP_FAIL; }
+
+    /* Pass 2: back up the network-critical keys, then write. */
+    nvs_handle_t cfg, prev;
+    if (nvs_open(CFG_NS, NVS_READWRITE, &cfg) != ESP_OK || nvs_open(CFG_PREV_NS, NVS_READWRITE, &prev) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS open failed"); return ESP_FAIL;
+    }
+    copy_str_key(cfg, prev, "ssid"); copy_str_key(cfg, prev, "password"); copy_str_key(cfg, prev, "target_ip");
+    uint8_t oldmac[6]; size_t ml = 6;
+    if (nvs_get_blob(cfg, "filter_mac", oldmac, &ml) == ESP_OK && ml == 6) nvs_set_blob(prev, "filter_mac", oldmac, 6);
+    else nvs_erase_key(prev, "filter_mac");
+    nvs_set_u8(prev, "trial", 1);
+    nvs_commit(prev); nvs_close(prev);
+
+    for (int i = 0; i < nkv; i++) {
+        const char *k = kv[i].key, *v = kv[i].val;
+        if (!strcmp(k, "ssid") || !strcmp(k, "password") || !strcmp(k, "target_ip")) nvs_set_str(cfg, k, v);
+        else if (!strcmp(k, "target_port") || !strcmp(k, "pres_thresh")) nvs_set_u16(cfg, k, (uint16_t)atoi(v));
+        else if (!strcmp(k, "csi_channel")) { if (atoi(v) == 0) nvs_erase_key(cfg, k); else nvs_set_u8(cfg, k, (uint8_t)atoi(v)); }
+        else if (!strcmp(k, "filter_mac")) { uint8_t mac[6]; parse_mac(v, mac); nvs_set_blob(cfg, k, mac, 6); }
+        ESP_LOGI(TAG, "config: %s set over the air", k);
+    }
+    nvs_commit(cfg); nvs_close(cfg);
+
+    const char *resp = "{\"status\":\"ok\",\"message\":\"Settings saved; rebooting. Old Wi-Fi settings come back if the new ones cannot connect.\"}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, strlen(resp));
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+    return ESP_OK;
+}
+
+/* Called by main.c on Got IP: this firmware and these settings work. */
+void ota_boot_wifi_ok(void)
+{
+    esp_ota_img_states_t st;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running && esp_ota_get_state_partition(running, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_ota_mark_app_valid_cancel_rollback();
+        ESP_LOGI(TAG, "New firmware joined Wi-Fi: marked valid, rollback cancelled");
+    }
+    nvs_handle_t prev;
+    if (nvs_open(CFG_PREV_NS, NVS_READWRITE, &prev) == ESP_OK) {
+        uint8_t trial = 0;
+        if (nvs_get_u8(prev, "trial", &trial) == ESP_OK && trial) {
+            nvs_set_u8(prev, "trial", 0); nvs_commit(prev);
+            ESP_LOGI(TAG, "Over-the-air settings joined Wi-Fi: kept");
+        }
+        nvs_close(prev);
+    }
+}
+
+/* Called by main.c when Wi-Fi gives up the boot wait: undo whatever is new. */
+void ota_boot_wifi_failed(void)
+{
+    nvs_handle_t prev, cfg;
+    uint8_t trial = 0;
+    if (nvs_open(CFG_PREV_NS, NVS_READWRITE, &prev) == ESP_OK) {
+        if (nvs_get_u8(prev, "trial", &trial) == ESP_OK && trial && nvs_open(CFG_NS, NVS_READWRITE, &cfg) == ESP_OK) {
+            copy_str_key(prev, cfg, "ssid"); copy_str_key(prev, cfg, "password"); copy_str_key(prev, cfg, "target_ip");
+            uint8_t mac[6]; size_t ml = 6;
+            if (nvs_get_blob(prev, "filter_mac", mac, &ml) == ESP_OK && ml == 6) nvs_set_blob(cfg, "filter_mac", mac, 6);
+            else nvs_erase_key(cfg, "filter_mac");
+            nvs_commit(cfg); nvs_close(cfg);
+            nvs_set_u8(prev, "trial", 0); nvs_commit(prev);
+            nvs_close(prev);
+            ESP_LOGW(TAG, "Over-the-air settings could not join Wi-Fi: restoring the previous ones and rebooting");
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_restart();
+        }
+        nvs_close(prev);
+    }
+    esp_ota_img_states_t st;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running && esp_ota_get_state_partition(running, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
+        ESP_LOGW(TAG, "New firmware could not join Wi-Fi: rolling back to the previous image");
+        esp_ota_mark_app_invalid_rollback_and_reboot();
+    }
+}
+
 /** Internal: start the HTTP server and register OTA endpoints. */
 static esp_err_t ota_start_server(httpd_handle_t *out_handle)
 {
@@ -242,6 +404,14 @@ static esp_err_t ota_start_server(httpd_handle_t *out_handle)
         .user_ctx = NULL,
     };
     httpd_register_uri_handler(server, &upload_uri);
+
+    httpd_uri_t config_uri = {
+        .uri      = "/config",
+        .method   = HTTP_POST,
+        .handler  = config_handler,
+        .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(server, &config_uri);
 
     ESP_LOGI(TAG, "OTA HTTP server started on port %d", OTA_PORT);
     ESP_LOGI(TAG, "  GET  /ota/status — firmware version info");

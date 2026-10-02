@@ -30,4 +30,10 @@ esp_err_t ota_update_init(void);
  */
 esp_err_t ota_update_init_ex(void **out_server);
 
+
+/** 0.8.7: main.c calls this on Got IP (marks new firmware valid, keeps OTA settings). */
+void ota_boot_wifi_ok(void);
+/** 0.8.7: main.c calls this when Wi-Fi gives up the boot wait (restores old settings / rolls back). */
+void ota_boot_wifi_failed(void);
+
 #endif /* OTA_UPDATE_H */

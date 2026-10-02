@@ -234,6 +234,14 @@ def build_nvs_csv(args):
         writer.writerow(["swarm_hb", "data", "u16", str(args.swarm_hb)])
     if args.swarm_ingest is not None:
         writer.writerow(["swarm_ingest", "data", "u16", str(args.swarm_ingest)])
+    # ADR-050 OTA pre-shared key. The firmware reads security/ota_psk and has
+    # always told operators to run `provision.py --ota-psk`, but the flag did
+    # not exist, so no node could ever accept an OTA (2 Oct 2026). The NVS
+    # image replaces the whole partition, so it must be written in the same
+    # pass as csi_cfg or one wipes the other.
+    if getattr(args, "ota_psk", None):
+        writer.writerow(["security", "namespace", "", ""])
+        writer.writerow(["ota_psk", "data", "string", args.ota_psk])
     return buf.getvalue()
 
 
@@ -354,6 +362,7 @@ def main():
     parser.add_argument("--zone", type=str, help="Zone name for this node (e.g. lobby, hallway)")
     parser.add_argument("--swarm-hb", type=int, help="Swarm heartbeat interval in seconds (default 30)")
     parser.add_argument("--swarm-ingest", type=int, help="Swarm vector ingest interval in seconds (default 5)")
+    parser.add_argument("--ota-psk", type=str, help="OTA pre-shared key (hex, 16-64 chars); enables POST /ota and /config on :8032")
     parser.add_argument("--dry-run", action="store_true", help="Generate NVS binary but don't flash")
     parser.add_argument("--force-partial", action="store_true",
                         help="[deprecated since #391/#574] Suppress the missing-WiFi-trio "

@@ -61,6 +61,8 @@ static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
 #define MAX_RETRY 10
 
+static bool s_ever_connected = false;
+
 static void event_handler(void *arg, esp_event_base_t event_base,
                           int32_t event_id, void *event_data)
 {
@@ -85,10 +87,19 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         if (s_retry_num == MAX_RETRY) {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
+        /* 0.8.7: three minutes from boot without ever joining means the new
+         * firmware or the over-the-air settings do not work here; put the old
+         * ones back (ota_update.c). Time, not tries: node 2 has needed 9 tries
+         * to find the in-room AP and would trip a retry count. */
+        if (!s_ever_connected && esp_timer_get_time() > 180LL * 1000 * 1000) {
+            ota_boot_wifi_failed();
+        }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
+        s_ever_connected = true;
+        ota_boot_wifi_ok();
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
