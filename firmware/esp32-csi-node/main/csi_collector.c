@@ -265,18 +265,22 @@ typedef struct { uint8_t mac[6]; int64_t last_us; bool used; } mi_src_t;
 /* In-room transmitter allowlist (2 Oct 2026, this deployment). Neighbours' APs
  * and passing phones took ~9 of each node's ~29 frames/s and evicted useful
  * sources from the 8-slot table; the host locator only uses these views.
- * Non-primary sources not listed are dropped before they cost anything. An
- * empty list (comment the entries out) restores "track everything". */
-static const uint8_t MI_ALLOW[][6] = {
-    {0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x01},   /* house AP */
-    {0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x02},   /* mango, ruview-tx (desk) */
-    {0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x03},   /* node 1 board (closet) */
-    {0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x04},   /* node 2 board (guitar stand) */
-    {0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x05},   /* node 3 board (nightstand) */
-};
+ * Non-primary sources not listed are dropped before they cost anything. */
+/* The real list lives in mi_allow_local.h, which git ignores: it holds the
+ * house AP's BSSID, and a BSSID in a public repo can be looked up in public
+ * Wi-Fi location databases. Copy mi_allow_local.h.example to start one.
+ * Without it the list is empty and every source is tracked, as before 0.8.5. */
+#if __has_include("mi_allow_local.h")
+#include "mi_allow_local.h"
+static const uint8_t MI_ALLOW[][6] = MI_ALLOW_LIST;
+#define MI_ALLOW_N (sizeof(MI_ALLOW) / sizeof(MI_ALLOW[0]))
+#else
+static const uint8_t MI_ALLOW[1][6] = {{0}};
+#define MI_ALLOW_N 0
+#endif
 static bool mi_allowed(const uint8_t *mac)
 {
-    size_t n = sizeof(MI_ALLOW) / sizeof(MI_ALLOW[0]);
+    size_t n = MI_ALLOW_N;
     if (n == 0) return true;
     for (size_t i = 0; i < n; i++)
         if (memcmp(MI_ALLOW[i], mac, 6) == 0) return true;

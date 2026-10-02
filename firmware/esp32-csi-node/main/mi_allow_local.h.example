@@ -1,0 +1,8 @@
+/* Copy to mi_allow_local.h (git-ignored) and list this deployment's in-room
+ * transmitters: the AP(s) the nodes sense and every RuView board. */
+#pragma once
+#define MI_ALLOW_LIST { \
+    {0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x01},   /* house AP */ \
+    {0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x02},   /* in-room transmitter AP */ \
+    {0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x03},   /* node 1 board */ \
+}
