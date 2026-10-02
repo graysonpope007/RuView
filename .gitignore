@@ -312,3 +312,4 @@ v2/crates/wifi-densepose-sensing-server/data/
 # (see the crate README); never commit generated artifacts.
 v2/crates/ruview-offaxis/pkg/
 firmware/esp32-csi-node/main/mi_allow_local.h
+firmware/esp32-csi-node/room-only.local.sh
