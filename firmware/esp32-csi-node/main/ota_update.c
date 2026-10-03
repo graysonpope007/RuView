@@ -377,6 +377,14 @@ static esp_err_t ota_start_server(httpd_handle_t *out_handle)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = OTA_PORT;
     config.max_uri_handlers = 12;  /* Extra slots for WASM endpoints (ADR-040). */
+    /* 0.8.8 (2 Oct 2026): 8 KB, not the 4 KB default. The first real OTA on
+     * silicon (node 1, 0.8.7 -> 0.8.8 over Wi-Fi) died with "A stack overflow
+     * in task httpd has been detected": the 1 KB receive buffer plus
+     * esp_ota_write and the float progress log do not fit in 4 KB, and
+     * POST /config keeps ~1.3 KB of locals too. The board rebooted on its old
+     * image (the half-written slot was never selected), so it was safe, but
+     * OTA could never have worked. */
+    config.stack_size = 8192;
     /* Increase receive timeout for large uploads. */
     config.recv_wait_timeout = 30;
 

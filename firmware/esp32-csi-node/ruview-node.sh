@@ -51,12 +51,14 @@ case "$cmd" in
     done ;;
   push)
     BIN=${2:-build/esp32-csi-node.bin}
-    want=$(strings "$BIN" | grep -m1 -E '^[0-9]+\.[0-9]+\.[0-9]+$')
+    # `|| true`: grep -m1 closes the pipe early, strings dies of SIGPIPE, and
+    # under pipefail + errexit that silently ended the script before any upload.
+    want=$(strings "$BIN" | grep -m1 -E '^[0-9]+\.[0-9]+\.[0-9]+$') || true
     for n in $(nodes "${1:-all}"); do
       tunnel "$n" || continue; port=$PORT
       echo "node $n: $(version "$port") -> $want, uploading $(wc -c < "$BIN" | tr -d ' ') bytes"
       curl -s -m 180 -X POST "http://127.0.0.1:$port/ota" -H "Authorization: Bearer $PSK" \
-        -H "Content-Type: application/octet-stream" --data-binary @"$BIN"; echo; untunnel
+        -H "Content-Type: application/octet-stream" --data-binary @"$BIN" || echo "(connection closed: the board may be rebooting)"; echo; untunnel
       echo "  waiting for it to reboot and rejoin..."; got="?"
       for _ in $(seq 1 24); do sleep 5; tunnel "$n" >/dev/null 2>&1 || continue; port=$PORT; got=$(version "$port"); untunnel; [ "$got" = "$want" ] && break; done
       [ "$got" = "$want" ] && echo "  ✓ node $n runs $got" || echo "  ✗ node $n reports $got (a failed image rolls back by itself)"
@@ -64,7 +66,7 @@ case "$cmd" in
   config)
     n=${1:?node id}; shift; [ $# -gt 0 ] || { echo "give key=value settings"; exit 1; }
     tunnel "$n"; port=$PORT; body=$(printf '%s\n' "$@")
-    curl -s -m 20 -X POST "http://127.0.0.1:$port/config" -H "Authorization: Bearer $PSK" --data-binary "$body"; echo; untunnel
+    curl -s -m 20 -X POST "http://127.0.0.1:$port/config" -H "Authorization: Bearer $PSK" --data-binary "$body" || echo "(connection closed: the board may be rebooting)"; echo; untunnel
     echo "  node $n reboots; if the new settings cannot join Wi-Fi it restores the old ones within ~3 min." ;;
   *) sed -n '2,10p' "$0"; exit 1 ;;
 esac
